@@ -2,109 +2,123 @@ package loader
 
 import (
 	"fmt"
-	_ "github.com/cilium/ebpf"
+
+	"github.com/cilium/ebpf"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
-	"log"
-	"net"
 )
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go multiplex ./ebpf/multiplex.c -- -I./ebpf/include/
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -type egress_settings multiplex multiplex.c
 
 type Loader struct {
-	externalQDisc *netlink.GenericQdisc
+	objs              *multiplexObjects
+	externalInterface netlink.Link
+	externalQDisc     *netlink.GenericQdisc
 }
 
-func getEBGPObjects() *multiplexObjects {
-	objs := &multiplexObjects{}
-	err := loadMultiplexObjects(objs, nil)
+func NewLoader() (*Loader, error) {
+	loader := &Loader{}
+	loader.objs = &multiplexObjects{}
+	err := loadMultiplexObjects(loader.objs, nil)
 	if err != nil {
-		log.Fatal("Load ", err)
+		return nil, err
 	}
-	return objs
+	return loader, nil
 }
 
-func LoadEBPF(externalInterface string, managedInterfaces map[string]int) *Loader {
-	err := increaseResourceLimits()
-	if err != nil {
-		fmt.Println("Failed to increase resource limits:", err)
+func (l *Loader) Close() {
+	_ = l.objs.Close()
+	if l.externalQDisc != nil {
+		err := netlink.QdiscDel(l.externalQDisc)
+		if err != nil {
+			fmt.Println("qDisc deletion error:", err)
+		}
 	}
+}
 
-	externalDev := getInterface(externalInterface)
-	fmt.Println("External interface:", externalDev.Name, "MTU:", externalDev.MTU)
-	objs := getEBGPObjects()
-	for key, value := range managedInterfaces {
-		createInterface(key)
-
-		// Set MTU
-		managedDev := getInterface(key)
-		link, err := netlink.LinkByIndex(managedDev.Index)
-		if err != nil {
-			log.Fatalln(err)
-		}
-		err = netlink.LinkSetMTU(link, externalDev.MTU)
-		if err != nil {
-			fmt.Println("Failed to set MTU value for the managed link", managedDev.Name)
-		}
-		// --------
-		if value > 16 || value < 0 {
-			log.Fatalln("Invalid label")
-		}
-
-		err = objs.IngressDestinationsMap.Put(uint32(value), uint32(managedDev.Index))
-		if err != nil {
-			log.Fatal("Put ", err)
-		}
-		applyEgress(managedDev, externalDev, value)
-		fmt.Println("Tunnel interface:", managedDev.Name, "Label:", value)
-	}
-
+func (l *Loader) ApplyExternal(dev netlink.Link) error {
 	// ===== Ingress from the external interface ======
-	qDisc, err := attachFilter(externalDev, objs.multiplexPrograms.Ingress, false)
+	qDisc, err := attachFilter(dev.Attrs().Index, l.objs.multiplexPrograms.Ingress, false)
 	if err != nil {
-		log.Fatal("Attach ", err)
+		return fmt.Errorf("attach filter: %w", err)
 	}
-
-	_ = objs.Close()
-
-	return &Loader{
-		externalQDisc: qDisc,
-	}
+	l.externalQDisc = qDisc
+	l.externalInterface = dev
+	return nil
 }
-func applyEgress(managedDev *net.Interface, externalDev *net.Interface, label int) {
+
+func (l *Loader) ApplyToManaged(dev netlink.Link, label uint32) (err error) {
+	if label > 16 {
+		return fmt.Errorf("invalid label: %d", label)
+	}
+	if l.externalInterface == nil {
+		return fmt.Errorf("no external interface")
+	}
+	err = l.objs.IngressDestinationsMap.Put(label, uint32(dev.Attrs().Index))
+	if err != nil {
+		return fmt.Errorf("ingress destinations map: %w", err)
+	}
+
 	// ===== Egress from the managed interface ======
-	objs := getEBGPObjects()
-	_, err := attachFilter(managedDev, objs.multiplexPrograms.Egress, true)
+	_, err = attachFilter(dev.Attrs().Index, l.objs.multiplexPrograms.Egress, true)
 	if err != nil {
-		log.Fatal("Attach ", err)
+		return fmt.Errorf("attach filter: %w", err)
 	}
 
-	// Settings
-	settings := struct {
-		externalInterface uint32
-		egressID          uint32
-	}{
-		uint32(externalDev.Index),
-		uint32(label),
+	settings := multiplexEgressSettings{
+		ExternalInterface: uint32(l.externalInterface.Attrs().Index),
+		EgressID:          label,
 	}
-	err = objs.SettingsMap.Put(uint32(0), settings)
+	err = l.objs.SettingsMap.Put(uint32(0), settings)
 	if err != nil {
-		log.Fatal("Put ", err)
+		return fmt.Errorf("settings map: %w", err)
 	}
-	_ = objs.Close()
+	return nil
 }
 
-// increaseResourceLimits https://prototype-kernel.readthedocs.io/en/latest/bpf/troubleshooting.html#memory-ulimits
-func increaseResourceLimits() error {
+func attachFilter(devIndex int, program *ebpf.Program, egress bool) (*netlink.GenericQdisc, error) {
+	qDisc := &netlink.GenericQdisc{
+		QdiscAttrs: netlink.QdiscAttrs{
+			LinkIndex: devIndex,
+			Handle:    netlink.MakeHandle(0xffff, 0),
+			Parent:    netlink.HANDLE_CLSACT,
+		},
+		QdiscType: "clsact",
+	}
+
+	err := netlink.QdiscReplace(qDisc)
+	if err != nil {
+		return nil, fmt.Errorf("qDisc replace error: %w", err)
+	}
+
+	parent := netlink.HANDLE_MIN_EGRESS
+	if !egress {
+		parent = netlink.HANDLE_MIN_INGRESS
+	}
+
+	filter := &netlink.BpfFilter{
+		FilterAttrs: netlink.FilterAttrs{
+			LinkIndex: devIndex,
+			Parent:    uint32(parent),
+			Handle:    1,
+			Priority:  1,
+			Protocol:  unix.ETH_P_ALL,
+		},
+		Fd:           program.FD(),
+		Name:         program.String(),
+		DirectAction: true,
+	}
+
+	if err := netlink.FilterReplace(filter); err != nil {
+		return nil, fmt.Errorf("tc filter replace error: %w", err)
+	}
+	return qDisc, nil
+}
+
+// IncreaseResourceLimits https://prototype-kernel.readthedocs.io/en/latest/bpf/troubleshooting.html#memory-ulimits
+func IncreaseResourceLimits() error {
 	return unix.Setrlimit(unix.RLIMIT_MEMLOCK, &unix.Rlimit{
 		Cur: unix.RLIM_INFINITY,
 		Max: unix.RLIM_INFINITY,
 	})
-}
-
-func (l Loader) Close() {
-	err := netlink.QdiscDel(l.externalQDisc)
-	if err != nil {
-		fmt.Println("qDisc deletion error:", err)
-	}
 }

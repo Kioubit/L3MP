@@ -12,6 +12,11 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type multiplexEgressSettings struct {
+	ExternalInterface uint32
+	EgressID          uint32
+}
+
 // loadMultiplex returns the embedded CollectionSpec for multiplex.
 func loadMultiplex() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_MultiplexBytes)
